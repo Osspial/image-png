@@ -10,7 +10,8 @@ use std::convert::From;
 
 use crc32fast::Hasher as Crc32;
 
-use miniz_oxide::inflate::stream;
+use miniz_oxide::inflate::TINFLStatus;
+use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 use crate::traits::ReadBytesExt;
 use crate::common::{BitDepth, BlendOp, ColorType, DisposeOp, Info, Unit, PixelDimensions, AnimationControl, FrameControl};
 use crate::chunk::{self, ChunkType, IHDR, IDAT, IEND};
@@ -27,10 +28,8 @@ const CHECKSUM_DISABLED: bool = cfg!(fuzzing);
 /// Ergonomics wrapper around `miniz_oxide::inflate::stream` for zlib compressed data.
 struct ZlibStream {
     /// Current decoding state.
-    state: stream::InflateState,
-
-    /// Buffer space for decoded zlib data.
-    decoded_buffer: Vec<u8>,
+    state: Box<DecompressorOxide>,
+    started: bool,
 }
 
 #[derive(Debug)]
@@ -258,6 +257,12 @@ impl StreamingDecoder {
                         self.current_chunk.crc.reset();
                         self.current_chunk.crc.update(&type_str);
                         self.current_chunk.remaining = length;
+
+                        match type_str {
+                            IDAT | chunk::fdAT => (),
+                            _ => self.inflater.finish_compressed_chunks(image_data)?,
+                        }
+
                         goto!(
                             ReadChunk(type_str, true),
                             emit Decoded::ChunkBegin(length, type_str)
@@ -356,8 +361,7 @@ impl StreamingDecoder {
                         raw_bytes.extend_from_slice(buf);
                         *remaining -= n;
                         if *remaining == 0 {
-                            goto!(n as usize, PartialChunk(type_str
-                            ))
+                            goto!(n as usize, PartialChunk(type_str))
                         } else {
                             goto!(n as usize, ReadChunk(type_str, false))
                         }
@@ -370,11 +374,9 @@ impl StreamingDecoder {
             DecodeData(type_str, mut n) => {
                 let chunk_len = self.current_chunk.raw_bytes.len();
                 let chunk_data = &self.current_chunk.raw_bytes[n..];
-                let complete = unimplemented!();
-                let (c, data) = self.inflater.update(chunk_data, complete)?;
-                image_data.extend_from_slice(data);
+                let c = self.inflater.update(chunk_data, image_data)?;
                 n += c;
-                if n == chunk_len && data.is_empty() && c == 0 {
+                if n == chunk_len && c == 0 {
                     goto!(
                         0,
                         ReadChunk(type_str, true),
@@ -659,35 +661,113 @@ impl Default for StreamingDecoder {
 impl ZlibStream {
     fn new() -> Self {
         ZlibStream {
-            state: stream::InflateState::new(miniz_oxide::DataFormat::Zlib),
-            decoded_buffer: vec![0; CHUNCK_BUFFER_SIZE],
+            state: Box::default(),
+            started: false,
         }
     }
 
     /// Fill the decoded buffer as far as possible from `data`.
-    fn update(&mut self, data: &[u8], finished: bool) -> Result<(usize, &[u8]), DecodingError> {
-        let flush = if finished {
-            miniz_oxide::MZFlush::Finish
-        } else {
-            miniz_oxide::MZFlush::None
+    /// On success returns the number of consumed input bytes.
+    fn update(&mut self, data: &[u8], image_data: &mut Vec<u8>)
+        -> Result<usize, DecodingError>
+    {
+        const BASE_FLAGS: u32 = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
+            | inflate_flags::TINFL_FLAG_HAS_MORE_INPUT;
+
+        let cur_len = self.prepare_vec_for_appending(image_data)?;
+
+        self.started = true;
+        let (status, in_consumed, out_consumed) = {
+            let mut cursor = io::Cursor::new(image_data.as_mut_slice());
+            cursor.set_position(cur_len as u64);
+            decompress(&mut self.state, data, &mut cursor, BASE_FLAGS)
         };
 
-        let result = stream::inflate(
-            &mut self.state,
-            data,
-            &mut self.decoded_buffer,
-            flush);
-
-        let miniz_oxide::StreamResult {
-            bytes_consumed,
-            bytes_written,
-            status,
-        } = result;
+        image_data.truncate(cur_len + out_consumed);
 
         match status {
-            Ok(_) => Ok((bytes_consumed, &self.decoded_buffer[..bytes_written])),
-            Err(err) => unimplemented!(),
+            | TINFLStatus::Done
+            | TINFLStatus::HasMoreOutput
+            | TINFLStatus::NeedsMoreInput => {
+                Ok(in_consumed)
+            },
+            _err => {
+                Err(DecodingError::CorruptFlateStream)
+            },
         }
+    }
+
+    /// Called after all consecutive IDAT chunks were handled.
+    ///
+    /// The compressed stream can be split on arbitrary byte boundaries. This enables some cleanup
+    /// within the decompressor and flushing additional data which may have been kept back in case
+    /// more data were passed to it.
+    fn finish_compressed_chunks(&mut self, image_data: &mut Vec<u8>)
+        -> Result<(), DecodingError>
+    {
+        const BASE_FLAGS: u32 = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+        if !self.started {
+            return Ok(());
+        }
+
+        loop {
+            let cur_len = self.prepare_vec_for_appending(image_data)?;
+
+            let (status, in_consumed, out_consumed) = {
+                let mut cursor = io::Cursor::new(image_data.as_mut_slice());
+                cursor.set_position(cur_len as u64);
+                decompress(&mut self.state, &[], &mut cursor, BASE_FLAGS)
+            };
+
+            debug_assert_eq!(in_consumed, 0);
+            image_data.truncate(cur_len + out_consumed);
+
+            match status {
+                TINFLStatus::Done => {
+                    return Ok(());
+                },
+                TINFLStatus::HasMoreOutput => (),
+                _err => {
+                    return Err(DecodingError::CorruptFlateStream);
+                },
+            }
+        }
+    }
+
+    /// Resize the vector to allow allocation of more data.
+    ///
+    /// Returns the previous position of the the end on success. Does not modify the vector on
+    /// error. miniz_oxide decompress expects previously decompressed data to be available. It
+    /// operates on a Cursor<&mut [u8]> writing new data. We temporarily resize the image_data
+    /// vector to make room for potential data then reset it to the actually written length
+    /// afterwards.
+    fn prepare_vec_for_appending(&self, vec: &mut Vec<u8>)
+        -> Result<usize, DecodingError>
+    {
+        let cur_len = vec.len();
+        let buffered_len = self.decoding_size(cur_len);
+
+        // buffered_len is corrected for all limits (including cursor). If current length exceeds
+        // that then the construction would not be valid.
+        if buffered_len <= cur_len {
+            return Err(DecodingError::LimitsExceeded);
+        }
+
+        vec.resize(buffered_len, 0u8);
+        Ok(cur_len)
+    }
+
+    fn decoding_size(&self, len: usize) -> usize {
+        // TODO: adhere to maximum allocation limits.
+        // Allocate one more chunk size than currently or double the length while ensuring that the
+        // allocation is valid and that any cursor within it will be valid.
+        len
+            .saturating_add(CHUNCK_BUFFER_SIZE.max(len))
+            // Note: both cut off and zero extension give correct results.
+            .min(u64::max_value() as usize)
+            .min(isize::max_value() as usize)
     }
 }
 

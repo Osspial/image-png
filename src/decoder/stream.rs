@@ -1,5 +1,4 @@
 extern crate crc32fast;
-extern crate inflate;
 
 use std::borrow::Cow;
 use std::default::Default;
@@ -11,7 +10,7 @@ use std::convert::From;
 
 use crc32fast::Hasher as Crc32;
 
-use self::inflate::InflateStream;
+use miniz_oxide::inflate::stream;
 use crate::traits::ReadBytesExt;
 use crate::common::{BitDepth, BlendOp, ColorType, DisposeOp, Info, Unit, PixelDimensions, AnimationControl, FrameControl};
 use crate::chunk::{self, ChunkType, IHDR, IDAT, IEND};
@@ -25,12 +24,13 @@ pub const CHUNCK_BUFFER_SIZE: usize = 32*1024;
 /// be used to detect that build.
 const CHECKSUM_DISABLED: bool = cfg!(fuzzing);
 
-fn zlib_stream() -> InflateStream {
-    if CHECKSUM_DISABLED {
-        InflateStream::from_zlib_no_checksum()
-    } else {
-        InflateStream::from_zlib()
-    }
+/// Ergonomics wrapper around `miniz_oxide::inflate::stream` for zlib compressed data.
+struct ZlibStream {
+    /// Current decoding state.
+    state: stream::InflateState,
+
+    /// Buffer space for decoded zlib data.
+    decoded_buffer: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -138,7 +138,7 @@ impl From<DecodingError> for io::Error {
 pub struct StreamingDecoder {
     state: Option<State>,
     current_chunk: ChunkState,
-    inflater: InflateStream,
+    inflater: ZlibStream,
     info: Option<Info>,
     current_seq_no: Option<u32>,
     have_idat: bool,
@@ -163,7 +163,7 @@ impl StreamingDecoder {
         StreamingDecoder {
             state: Some(State::Signature(0, [0; 7])),
             current_chunk: ChunkState::default(),
-            inflater: zlib_stream(),
+            inflater: ZlibStream::new(),
             info: None,
             current_seq_no: None,
             have_idat: false
@@ -176,7 +176,7 @@ impl StreamingDecoder {
         self.current_chunk.crc = Crc32::new();
         self.current_chunk.remaining = 0;
         self.current_chunk.raw_bytes.clear();
-        self.inflater = zlib_stream();
+        self.inflater = ZlibStream::new();
         self.info = None;
         self.current_seq_no = None;
         self.have_idat = false;
@@ -370,7 +370,8 @@ impl StreamingDecoder {
             DecodeData(type_str, mut n) => {
                 let chunk_len = self.current_chunk.raw_bytes.len();
                 let chunk_data = &self.current_chunk.raw_bytes[n..];
-                let (c, data) = self.inflater.update(chunk_data)?;
+                let complete = unimplemented!();
+                let (c, data) = self.inflater.update(chunk_data, complete)?;
                 image_data.extend_from_slice(data);
                 n += c;
                 if n == chunk_len && data.is_empty() && c == 0 {
@@ -459,7 +460,7 @@ impl StreamingDecoder {
             }
             0
         });
-        self.inflater = zlib_stream();
+        self.inflater = ZlibStream::new();
         let fc = FrameControl {
             sequence_number: next_seq_no,
             width: buf.read_be()?,
@@ -652,6 +653,41 @@ impl StreamingDecoder {
 impl Default for StreamingDecoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ZlibStream {
+    fn new() -> Self {
+        ZlibStream {
+            state: stream::InflateState::new(miniz_oxide::DataFormat::Zlib),
+            decoded_buffer: vec![0; CHUNCK_BUFFER_SIZE],
+        }
+    }
+
+    /// Fill the decoded buffer as far as possible from `data`.
+    fn update(&mut self, data: &[u8], finished: bool) -> Result<(usize, &[u8]), DecodingError> {
+        let flush = if finished {
+            miniz_oxide::MZFlush::Finish
+        } else {
+            miniz_oxide::MZFlush::None
+        };
+
+        let result = stream::inflate(
+            &mut self.state,
+            data,
+            &mut self.decoded_buffer,
+            flush);
+
+        let miniz_oxide::StreamResult {
+            bytes_consumed,
+            bytes_written,
+            status,
+        } = result;
+
+        match status {
+            Ok(_) => Ok((bytes_consumed, &self.decoded_buffer[..bytes_written])),
+            Err(err) => unimplemented!(),
+        }
     }
 }
 

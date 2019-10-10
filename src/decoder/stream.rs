@@ -258,11 +258,6 @@ impl StreamingDecoder {
                         self.current_chunk.crc.update(&type_str);
                         self.current_chunk.remaining = length;
 
-                        match type_str {
-                            IDAT | chunk::fdAT => (),
-                            _ => self.inflater.finish_compressed_chunks(image_data)?,
-                        }
-
                         goto!(
                             ReadChunk(type_str, true),
                             emit Decoded::ChunkBegin(length, type_str)
@@ -333,7 +328,9 @@ impl StreamingDecoder {
                     // Handle other chunks
                     _ => {
                         if self.current_chunk.remaining == 0 { // complete chunk
-                            Ok((0, self.parse_chunk(type_str)?))
+                            let parsed = self.parse_chunk(type_str)?;
+                            self.current_chunk.raw_bytes.clear();
+                            Ok((0, parsed))
                         } else {
                             goto!(
                                 0, ReadChunk(type_str, true),
@@ -342,12 +339,16 @@ impl StreamingDecoder {
                         }
                     }
                 }
-
             },
             ReadChunk(type_str, clear) => {
-                if clear {
-                    self.current_chunk.raw_bytes.clear();
+                match type_str {
+                    IDAT | chunk::fdAT => (),
+                    _ => {
+                        self.inflater.finish_compressed_chunks(
+                            &self.current_chunk.raw_bytes, image_data)?;
+                    },
                 }
+
                 if self.current_chunk.remaining > 0 {
                     let ChunkState { crc, remaining, raw_bytes } = &mut self.current_chunk;
                     let buf_avail = raw_bytes.capacity() - raw_bytes.len();
@@ -374,12 +375,14 @@ impl StreamingDecoder {
             DecodeData(type_str, mut n) => {
                 let chunk_len = self.current_chunk.raw_bytes.len();
                 let chunk_data = &self.current_chunk.raw_bytes[n..];
-                let c = self.inflater.update(chunk_data, image_data)?;
+                let c = self.inflater.decompress(chunk_data, image_data)?;
                 n += c;
-                if n == chunk_len && c == 0 {
+                // We can no longer make progress.
+                if n == chunk_len || c == 0 {
+                    self.current_chunk.raw_bytes.drain(..n).for_each(drop);
                     goto!(
                         0,
-                        ReadChunk(type_str, true),
+                        ReadChunk(type_str, false),
                         emit Decoded::ImageData
                     )
                 } else {
@@ -668,7 +671,7 @@ impl ZlibStream {
 
     /// Fill the decoded buffer as far as possible from `data`.
     /// On success returns the number of consumed input bytes.
-    fn update(&mut self, data: &[u8], image_data: &mut Vec<u8>)
+    fn decompress(&mut self, data: &[u8], image_data: &mut Vec<u8>)
         -> Result<usize, DecodingError>
     {
         const BASE_FLAGS: u32 = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
@@ -679,6 +682,7 @@ impl ZlibStream {
 
         self.started = true;
         let (status, in_consumed, out_consumed) = {
+            dbg!(image_data.as_mut_slice().len());
             let mut cursor = io::Cursor::new(image_data.as_mut_slice());
             cursor.set_position(cur_len as u64);
             decompress(&mut self.state, data, &mut cursor, BASE_FLAGS)
@@ -693,6 +697,7 @@ impl ZlibStream {
                 Ok(in_consumed)
             },
             _err => {
+                dbg!(_err);
                 Err(DecodingError::CorruptFlateStream)
             },
         }
@@ -703,7 +708,7 @@ impl ZlibStream {
     /// The compressed stream can be split on arbitrary byte boundaries. This enables some cleanup
     /// within the decompressor and flushing additional data which may have been kept back in case
     /// more data were passed to it.
-    fn finish_compressed_chunks(&mut self, image_data: &mut Vec<u8>)
+    fn finish_compressed_chunks(&mut self, tail: &[u8], image_data: &mut Vec<u8>)
         -> Result<(), DecodingError>
     {
         const BASE_FLAGS: u32 = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
@@ -712,16 +717,17 @@ impl ZlibStream {
             return Ok(());
         }
 
+        let mut start = 0;
         loop {
             let cur_len = self.prepare_vec_for_appending(image_data)?;
 
             let (status, in_consumed, out_consumed) = {
                 let mut cursor = io::Cursor::new(image_data.as_mut_slice());
                 cursor.set_position(cur_len as u64);
-                decompress(&mut self.state, &[], &mut cursor, BASE_FLAGS)
+                decompress(&mut self.state, &tail[start..], &mut cursor, BASE_FLAGS)
             };
 
-            debug_assert_eq!(in_consumed, 0);
+            start += in_consumed;
             image_data.truncate(cur_len + out_consumed);
 
             match status {
@@ -730,6 +736,7 @@ impl ZlibStream {
                 },
                 TINFLStatus::HasMoreOutput => (),
                 _err => {
+                    dbg!(_err);
                     return Err(DecodingError::CorruptFlateStream);
                 },
             }

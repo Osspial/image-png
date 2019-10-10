@@ -29,7 +29,14 @@ const CHECKSUM_DISABLED: bool = cfg!(fuzzing);
 struct ZlibStream {
     /// Current decoding state.
     state: Box<DecompressorOxide>,
+    /// If there has been a call to decompress already.
     started: bool,
+    /// Remaining buffered decoded bytes.
+    /// The decoder sometimes wants inspect some already finished bytes for further decoding. So we
+    /// keep a total of 32KB of decoded data available as long as more data may be appended.
+    buffer: Vec<u8>,
+    /// The cursor position in the output stream as a buffer index.
+    out_pos: usize,
 }
 
 #[derive(Debug)]
@@ -666,6 +673,8 @@ impl ZlibStream {
         ZlibStream {
             state: Box::default(),
             started: false,
+            buffer: Vec::with_capacity(CHUNCK_BUFFER_SIZE),
+            out_pos: 0,
         }
     }
 
@@ -678,17 +687,17 @@ impl ZlibStream {
             | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
             | inflate_flags::TINFL_FLAG_HAS_MORE_INPUT;
 
-        let cur_len = self.prepare_vec_for_appending(image_data)?;
+        self.prepare_vec_for_appending();
 
-        self.started = true;
         let (status, in_consumed, out_consumed) = {
-            dbg!(image_data.as_mut_slice().len());
-            let mut cursor = io::Cursor::new(image_data.as_mut_slice());
-            cursor.set_position(cur_len as u64);
+            let mut cursor = io::Cursor::new(self.buffer.as_mut_slice());
+            cursor.set_position(self.out_pos as u64);
             decompress(&mut self.state, data, &mut cursor, BASE_FLAGS)
         };
 
-        image_data.truncate(cur_len + out_consumed);
+        self.started = true;
+        self.out_pos += out_consumed;
+        self.transfer_finished_data(image_data);
 
         match status {
             | TINFLStatus::Done
@@ -697,7 +706,6 @@ impl ZlibStream {
                 Ok(in_consumed)
             },
             _err => {
-                dbg!(_err);
                 Err(DecodingError::CorruptFlateStream)
             },
         }
@@ -713,30 +721,35 @@ impl ZlibStream {
     {
         const BASE_FLAGS: u32 = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
             | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+
         if !self.started {
             return Ok(());
         }
 
         let mut start = 0;
         loop {
-            let cur_len = self.prepare_vec_for_appending(image_data)?;
+            self.prepare_vec_for_appending();
 
             let (status, in_consumed, out_consumed) = {
-                let mut cursor = io::Cursor::new(image_data.as_mut_slice());
-                cursor.set_position(cur_len as u64);
+                // TODO: we may be able to avoid the indirection through the buffer here.
+                // First append all buffered data and then create a cursor on the image_data
+                // instead.
+                let mut cursor = io::Cursor::new(self.buffer.as_mut_slice());
+                cursor.set_position(self.out_pos as u64);
                 decompress(&mut self.state, &tail[start..], &mut cursor, BASE_FLAGS)
             };
 
             start += in_consumed;
-            image_data.truncate(cur_len + out_consumed);
+            self.out_pos += out_consumed;
 
             match status {
                 TINFLStatus::Done => {
+                    self.buffer.truncate(self.out_pos as usize);
+                    image_data.append(&mut self.buffer);
                     return Ok(());
                 },
                 TINFLStatus::HasMoreOutput => (),
                 _err => {
-                    dbg!(_err);
                     return Err(DecodingError::CorruptFlateStream);
                 },
             }
@@ -744,37 +757,31 @@ impl ZlibStream {
     }
 
     /// Resize the vector to allow allocation of more data.
-    ///
-    /// Returns the previous position of the the end on success. Does not modify the vector on
-    /// error. miniz_oxide decompress expects previously decompressed data to be available. It
-    /// operates on a Cursor<&mut [u8]> writing new data. We temporarily resize the image_data
-    /// vector to make room for potential data then reset it to the actually written length
-    /// afterwards.
-    fn prepare_vec_for_appending(&self, vec: &mut Vec<u8>)
-        -> Result<usize, DecodingError>
-    {
-        let cur_len = vec.len();
-        let buffered_len = self.decoding_size(cur_len);
-
-        // buffered_len is corrected for all limits (including cursor). If current length exceeds
-        // that then the construction would not be valid.
-        if buffered_len <= cur_len {
-            return Err(DecodingError::LimitsExceeded);
-        }
-
-        vec.resize(buffered_len, 0u8);
-        Ok(cur_len)
+    fn prepare_vec_for_appending(&mut self) {
+        let buffered_len = self.decoding_size(self.out_pos as usize);
+        debug_assert!(self.buffer.len() <= buffered_len);
+        self.buffer.resize(buffered_len, 0u8);
     }
 
     fn decoding_size(&self, len: usize) -> usize {
-        // TODO: adhere to maximum allocation limits.
         // Allocate one more chunk size than currently or double the length while ensuring that the
         // allocation is valid and that any cursor within it will be valid.
         len
+            // This keeps the buffer size a power-of-two, required by miniz_oxide.
             .saturating_add(CHUNCK_BUFFER_SIZE.max(len))
+            // Ensure all buffer indices are valid cursor positions.
             // Note: both cut off and zero extension give correct results.
             .min(u64::max_value() as usize)
+            // Ensure the allocation request is valid.
+            // TODO: maximum allocation limits?
             .min(isize::max_value() as usize)
+    }
+
+    fn transfer_finished_data(&mut self, image_data: &mut Vec<u8>) {
+        let safe = self.out_pos.saturating_sub(CHUNCK_BUFFER_SIZE);
+        // TODO: allocation limits.
+        image_data.extend(self.buffer.drain(..safe));
+        self.out_pos -= safe;
     }
 }
 

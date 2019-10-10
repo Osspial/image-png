@@ -261,6 +261,24 @@ impl StreamingDecoder {
                             (val >> 8) as u8,
                             val as u8
                         ];
+
+                        if self.inflater.started {
+                            match type_str {
+                                IDAT | chunk::fdAT => (),
+                                _ => {
+                                    self.inflater.finish_compressed_chunks(
+                                        &self.current_chunk.raw_bytes, image_data)?;
+                                    self.inflater.started = false;
+
+                                    return goto!(
+                                        0,
+                                        U32Byte3(type_, val),
+                                        emit Decoded::ImageData
+                                    );
+                                },
+                            }
+                        }
+
                         self.current_chunk.crc.reset();
                         self.current_chunk.crc.update(&type_str);
                         self.current_chunk.remaining = length;
@@ -348,14 +366,6 @@ impl StreamingDecoder {
                 }
             },
             ReadChunk(type_str, clear) => {
-                match type_str {
-                    IDAT | chunk::fdAT => (),
-                    _ => {
-                        self.inflater.finish_compressed_chunks(
-                            &self.current_chunk.raw_bytes, image_data)?;
-                    },
-                }
-
                 if self.current_chunk.remaining > 0 {
                     let ChunkState { crc, remaining, raw_bytes } = &mut self.current_chunk;
                     let buf_avail = raw_bytes.capacity() - raw_bytes.len();

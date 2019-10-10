@@ -683,7 +683,7 @@ impl ZlibStream {
         ZlibStream {
             state: Box::default(),
             started: false,
-            buffer: vec![0; 2*CHUNCK_BUFFER_SIZE],
+            buffer: vec![0; CHUNCK_BUFFER_SIZE],
             out_pos: 0,
         }
     }
@@ -714,7 +714,7 @@ impl ZlibStream {
 
         self.started = true;
         self.out_pos += out_consumed;
-        self.transfer_finished_data(image_data);
+        // self.transfer_finished_data(image_data);
 
         match status {
             | TINFLStatus::Done

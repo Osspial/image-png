@@ -268,7 +268,7 @@ impl StreamingDecoder {
                                 _ => {
                                     self.inflater.finish_compressed_chunks(
                                         &self.current_chunk.raw_bytes, image_data)?;
-                                    self.inflater.started = false;
+                                    self.inflater.reset();
 
                                     return goto!(
                                         0,
@@ -683,9 +683,16 @@ impl ZlibStream {
         ZlibStream {
             state: Box::default(),
             started: false,
-            buffer: Vec::with_capacity(CHUNCK_BUFFER_SIZE),
+            buffer: vec![0; 2*CHUNCK_BUFFER_SIZE],
             out_pos: 0,
         }
+    }
+
+    fn reset(&mut self) {
+        self.started = false;
+        self.buffer.clear();
+        self.out_pos = 0;
+        *self.state = DecompressorOxide::default();
     }
 
     /// Fill the decoded buffer as far as possible from `data`.
@@ -768,7 +775,11 @@ impl ZlibStream {
 
     /// Resize the vector to allow allocation of more data.
     fn prepare_vec_for_appending(&mut self) {
-        let buffered_len = self.decoding_size(self.out_pos as usize);
+        if self.buffer.len().saturating_sub(self.out_pos) >= CHUNCK_BUFFER_SIZE {
+            return;
+        }
+
+        let buffered_len = self.decoding_size(self.buffer.len());
         debug_assert!(self.buffer.len() <= buffered_len);
         self.buffer.resize(buffered_len, 0u8);
     }

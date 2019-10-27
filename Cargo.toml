@@ -14,7 +14,7 @@ exclude = [
 ]
 
 [dependencies]
-miniz_oxide = "0.3"
+miniz_oxide = { version = "0.3", git = "https://github.com/Frommi/miniz_oxide/", rev = "2a5703a4de8557dcbac981a52ea7cb1e414a169b" }
 deflate = { version = "0.7.12", optional = true }
 bitflags = "1.0"
 crc32fast = "1.2.0"
